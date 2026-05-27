@@ -18,6 +18,8 @@ pub struct Store {
     pub cycle_counts: Arc<Mutex<Vec<CycleCount>>>,
     pub waves: Arc<Mutex<HashMap<String, Wave>>>,
     pub labels: Arc<Mutex<Vec<BarcodeLabel>>>,
+    pub serialized: Arc<Mutex<HashMap<String, SerializedItem>>>,
+    pub rfid_tags: Arc<Mutex<HashMap<String, RfidTag>>>,
 }
 
 impl Store {
@@ -34,6 +36,8 @@ impl Store {
             cycle_counts: Arc::new(Mutex::new(Vec::new())),
             waves: Arc::new(Mutex::new(HashMap::new())),
             labels: Arc::new(Mutex::new(Vec::new())),
+            serialized: Arc::new(Mutex::new(HashMap::new())),
+            rfid_tags: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

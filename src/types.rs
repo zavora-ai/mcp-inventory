@@ -84,12 +84,47 @@ pub struct Wave {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BarcodeLabel {
     pub id: String,
-    pub barcode_type: String, // sku, location, lot, shipment, receipt
+    pub barcode_type: String, // sku, location, lot, shipment, receipt, serial, rfid
     pub entity_id: String,
-    pub barcode_format: String, // code128, ean13, qr, datamatrix
+    pub barcode_format: String, // code128, ean13, qr, datamatrix, rfid_epc
     pub barcode_value: String,
     pub label_text: Vec<String>,
     pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SerializedItem {
+    pub serial_number: String,
+    pub sku: String,
+    pub status: String, // in_stock, reserved, shipped, returned, scrapped
+    pub location_id: String,
+    pub lot_number: Option<String>,
+    pub manufacture_date: Option<String>,
+    pub expiry_date: Option<String>,
+    pub rfid_tag: Option<String>,
+    pub qr_code: Option<String>,
+    pub history: Vec<SerialEvent>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SerialEvent {
+    pub event_type: String, // received, moved, picked, shipped, returned, scrapped
+    pub location: String,
+    pub actor: String,
+    pub timestamp: String,
+    pub reference: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RfidTag {
+    pub epc: String, // Electronic Product Code (96-bit hex)
+    pub serial_number: Option<String>,
+    pub sku: Option<String>,
+    pub location_id: String,
+    pub last_read_at: String,
+    pub read_count: u32,
+    pub status: String, // active, lost, decommissioned
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

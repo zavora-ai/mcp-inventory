@@ -455,6 +455,116 @@ impl InventoryServer {
         }
         json!({"count": labels.len(), "barcode_format": format, "labels": labels}).to_string()
     }
+
+    // === Serialized Warehousing ===
+
+    #[tool(description = "Register a serialized item (individual unit tracking by serial number). Optionally link RFID tag.")]
+    async fn serial_register(&self, Parameters(input): Parameters<SerialRegisterInput>) -> String {
+        let qr = format!("QR:SN={}&SKU={}&LOC={}", input.serial_number, input.sku, input.location_id);
+        let item = SerializedItem {
+            serial_number: input.serial_number.clone(), sku: input.sku, status: "in_stock".into(),
+            location_id: input.location_id.clone(), lot_number: input.lot_number,
+            manufacture_date: input.manufacture_date, expiry_date: input.expiry_date,
+            rfid_tag: input.rfid_tag.clone(), qr_code: Some(qr.clone()),
+            history: vec![SerialEvent { event_type: "received".into(), location: input.location_id, actor: "system".into(), timestamp: now(), reference: None }],
+            metadata: json!({}),
+        };
+        self.store.serialized.lock().unwrap().insert(input.serial_number.clone(), item);
+        // If RFID tag provided, register it too
+        if let Some(epc) = input.rfid_tag {
+            self.store.rfid_tags.lock().unwrap().insert(epc.clone(), RfidTag { epc, serial_number: Some(input.serial_number.clone()), sku: None, location_id: String::new(), last_read_at: now(), read_count: 0, status: "active".into() });
+        }
+        json!({"status": "registered", "serial_number": input.serial_number, "qr_code": qr}).to_string()
+    }
+
+    #[tool(description = "Move a serialized item to a new location (tracks full chain of custody).")]
+    async fn serial_move(&self, Parameters(input): Parameters<SerialMoveInput>) -> String {
+        let mut items = self.store.serialized.lock().unwrap();
+        match items.get_mut(&input.serial_number) {
+            Some(item) => {
+                let event_type = input.event_type.unwrap_or_else(|| "moved".into());
+                item.location_id = input.to_location.clone();
+                item.status = match event_type.as_str() { "shipped" => "shipped", "scrapped" => "scrapped", "returned" => "in_stock", _ => "in_stock" }.into();
+                item.history.push(SerialEvent { event_type: event_type.clone(), location: input.to_location, actor: input.actor, timestamp: now(), reference: input.reference });
+                json!({"status": "moved", "serial_number": input.serial_number, "event": event_type, "history_length": item.history.len()}).to_string()
+            }
+            None => json!({"error": "SERIAL_NOT_FOUND"}).to_string(),
+        }
+    }
+
+    #[tool(description = "Look up a serialized item by serial number (full history, location, status).")]
+    async fn serial_lookup(&self, Parameters(input): Parameters<SerialQueryInput>) -> String {
+        match self.store.serialized.lock().unwrap().get(&input.serial_number) {
+            Some(item) => serde_json::to_string_pretty(item).unwrap_or_default(),
+            None => json!({"error": "SERIAL_NOT_FOUND"}).to_string(),
+        }
+    }
+
+    #[tool(description = "List all serialized items at a location.")]
+    async fn serial_scan_location(&self, Parameters(input): Parameters<SerialScanInput>) -> String {
+        let items: Vec<_> = self.store.serialized.lock().unwrap().values().filter(|i| i.location_id == input.location_id).cloned().collect();
+        json!({"location_id": input.location_id, "count": items.len(), "items": items.iter().map(|i| json!({"serial": i.serial_number, "sku": i.sku, "status": i.status, "rfid": i.rfid_tag, "lot": i.lot_number})).collect::<Vec<_>>()}).to_string()
+    }
+
+    // === RFID ===
+
+    #[tool(description = "Register an RFID tag (EPC) and link it to a serial number or SKU.")]
+    async fn rfid_register(&self, Parameters(input): Parameters<RfidRegisterInput>) -> String {
+        let tag = RfidTag { epc: input.epc.clone(), serial_number: input.serial_number, sku: input.sku, location_id: input.location_id, last_read_at: now(), read_count: 0, status: "active".into() };
+        self.store.rfid_tags.lock().unwrap().insert(input.epc.clone(), tag);
+        json!({"status": "registered", "epc": input.epc}).to_string()
+    }
+
+    #[tool(description = "Process RFID reader scan — bulk update tag locations and detect missing/unexpected tags.")]
+    async fn rfid_bulk_read(&self, Parameters(input): Parameters<RfidReadInput>) -> String {
+        let mut tags = self.store.rfid_tags.lock().unwrap();
+        let mut found = Vec::new();
+        let mut unknown = Vec::new();
+        for epc in &input.epcs {
+            if let Some(tag) = tags.get_mut(epc) {
+                tag.location_id = input.location_id.clone();
+                tag.last_read_at = now();
+                tag.read_count += 1;
+                found.push(json!({"epc": epc, "serial": tag.serial_number, "sku": tag.sku}));
+            } else {
+                unknown.push(epc.clone());
+            }
+        }
+        // Detect missing — tags expected at this location but not scanned
+        let missing: Vec<_> = tags.values().filter(|t| t.location_id == input.location_id && t.status == "active" && !input.epcs.contains(&t.epc)).map(|t| json!({"epc": t.epc, "serial": t.serial_number})).collect();
+        json!({"location_id": input.location_id, "scanned": input.epcs.len(), "found": found.len(), "unknown": unknown.len(), "missing": missing.len(), "found_tags": found, "unknown_epcs": unknown, "missing_tags": missing}).to_string()
+    }
+
+    #[tool(description = "Look up an RFID tag by EPC.")]
+    async fn rfid_lookup(&self, Parameters(input): Parameters<RfidQueryInput>) -> String {
+        match self.store.rfid_tags.lock().unwrap().get(&input.epc) {
+            Some(tag) => serde_json::to_string_pretty(tag).unwrap_or_default(),
+            None => json!({"error": "RFID_NOT_FOUND", "epc": input.epc}).to_string(),
+        }
+    }
+
+    // === QR Code ===
+
+    #[tool(description = "Generate a QR code payload for a serial, SKU, location, or shipment. Returns the encoded data string.")]
+    async fn qr_generate(&self, Parameters(input): Parameters<QrGenerateInput>) -> String {
+        let base = match input.entity_type.as_str() {
+            "serial" => {
+                let item = self.store.serialized.lock().unwrap().get(&input.entity_id).cloned();
+                match item {
+                    Some(i) => format!("SN={}&SKU={}&LOT={}&LOC={}", i.serial_number, i.sku, i.lot_number.unwrap_or_default(), i.location_id),
+                    None => format!("SN={}", input.entity_id),
+                }
+            }
+            "sku" => format!("SKU={}", input.entity_id),
+            "location" => format!("LOC={}", input.entity_id),
+            "shipment" => format!("SHP={}", input.entity_id),
+            _ => format!("ID={}", input.entity_id),
+        };
+        let payload = if let Some(extra) = input.extra_data { format!("{}&DATA={}", base, extra) } else { base };
+        let label_id = format!("lbl_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        self.store.labels.lock().unwrap().push(BarcodeLabel { id: label_id.clone(), barcode_type: input.entity_type.clone(), entity_id: input.entity_id, barcode_format: "qr".into(), barcode_value: payload.clone(), label_text: vec![payload.clone()], generated_at: now() });
+        json!({"label_id": label_id, "format": "qr", "payload": payload, "printable": true}).to_string()
+    }
 }
 
 // --- Additional input types ---
@@ -543,4 +653,86 @@ pub struct LabelBatchInput {
     pub entity_ids: Vec<String>,
     /// Barcode format (default: code128)
     pub barcode_format: Option<String>,
+}
+
+// === Serialized / RFID / QR Input Types ===
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SerialRegisterInput {
+    /// Serial number (unique identifier for this individual unit)
+    pub serial_number: String,
+    /// SKU this serial belongs to
+    pub sku: String,
+    /// Location where item is stored
+    pub location_id: String,
+    /// Lot/batch number
+    pub lot_number: Option<String>,
+    /// Manufacture date
+    pub manufacture_date: Option<String>,
+    /// Expiry date
+    pub expiry_date: Option<String>,
+    /// RFID EPC tag (if tagged)
+    pub rfid_tag: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SerialMoveInput {
+    /// Serial number
+    pub serial_number: String,
+    /// New location
+    pub to_location: String,
+    /// Actor
+    pub actor: String,
+    /// Event type: moved, picked, shipped, returned, scrapped
+    pub event_type: Option<String>,
+    /// Reference (order ID, etc.)
+    pub reference: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SerialQueryInput {
+    /// Serial number to look up
+    pub serial_number: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SerialScanInput {
+    /// Location ID to scan
+    pub location_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RfidRegisterInput {
+    /// EPC (Electronic Product Code, 96-bit hex string)
+    pub epc: String,
+    /// Serial number to link (optional)
+    pub serial_number: Option<String>,
+    /// SKU to link (optional)
+    pub sku: Option<String>,
+    /// Location where tag is
+    pub location_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RfidReadInput {
+    /// Location ID where RFID reader is scanning
+    pub location_id: String,
+    /// EPCs detected by the reader
+    pub epcs: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RfidQueryInput {
+    /// EPC to look up
+    pub epc: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct QrGenerateInput {
+    /// Entity type: serial, sku, location, shipment
+    pub entity_type: String,
+    /// Entity ID
+    pub entity_id: String,
+    /// Extra data to encode in QR (JSON string)
+    pub extra_data: Option<Value>,
 }
