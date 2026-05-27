@@ -1,0 +1,116 @@
+server_id = "mcp_inventory"
+display_name = "Inventory"
+version = "1.0.0"
+domain = "inventory"
+sdk_version = "0.1.0"
+risk_level = "medium"
+writes_allowed = "gated"
+transports = ["stdio"]
+credentials = []
+governance_gates = ["stock_movement_audit"]
+environments = ["development", "staging", "production"]
+
+[[tools]]
+name = "item_upsert"
+description = "Add/update inventory item"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "item_list"
+description = "List inventory items"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "location_create"
+description = "Create warehouse/bin location"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "location_list"
+description = "List locations"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "stock_receive"
+description = "Receive stock into location"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "stock_issue"
+description = "Issue stock from location"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "stock_transfer"
+description = "Transfer between locations"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "stock_adjust"
+description = "Adjust stock (cycle count)"
+risk_class = "internal_write"
+requires_approval = true
+credential_bindings = []
+
+[[tools]]
+name = "stock_check"
+description = "Check stock level"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "reorder_alerts"
+description = "Items below reorder point"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "stock_reserve"
+description = "Reserve stock for order"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "stock_release"
+description = "Release reservation"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bom_set"
+description = "Define bill of materials"
+risk_class = "internal_write"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "bom_check"
+description = "Check BOM availability"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
+
+[[tools]]
+name = "movement_history"
+description = "Stock movement history"
+risk_class = "read_only"
+requires_approval = false
+credential_bindings = []
