@@ -70,6 +70,29 @@ pub struct CycleCount {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Wave {
+    pub id: String,
+    pub name: String,
+    pub status: String, // planning, released, in_progress, completed
+    pub pick_ids: Vec<String>,
+    pub priority: String,
+    pub created_at: String,
+    pub released_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BarcodeLabel {
+    pub id: String,
+    pub barcode_type: String, // sku, location, lot, shipment, receipt
+    pub entity_id: String,
+    pub barcode_format: String, // code128, ean13, qr, datamatrix
+    pub barcode_value: String,
+    pub label_text: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StockLevel {
     pub sku: String,
     pub location_id: String,

@@ -2,7 +2,7 @@
 
 [package]
 name = "mcp-inventory"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Inventory & Warehouse MCP server — stock management, BOM, locations, transfers, reorder alerts, lot tracking, reservations"
 license = "Apache-2.0"

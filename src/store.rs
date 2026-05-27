@@ -16,6 +16,8 @@ pub struct Store {
     pub pick_orders: Arc<Mutex<HashMap<String, PickOrder>>>,
     pub putaway_rules: Arc<Mutex<Vec<PutawayRule>>>,
     pub cycle_counts: Arc<Mutex<Vec<CycleCount>>>,
+    pub waves: Arc<Mutex<HashMap<String, Wave>>>,
+    pub labels: Arc<Mutex<Vec<BarcodeLabel>>>,
 }
 
 impl Store {
@@ -30,6 +32,8 @@ impl Store {
             pick_orders: Arc::new(Mutex::new(HashMap::new())),
             putaway_rules: Arc::new(Mutex::new(Vec::new())),
             cycle_counts: Arc::new(Mutex::new(Vec::new())),
+            waves: Arc::new(Mutex::new(HashMap::new())),
+            labels: Arc::new(Mutex::new(Vec::new())),
         }
     }
 

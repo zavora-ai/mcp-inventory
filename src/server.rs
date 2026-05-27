@@ -348,6 +348,113 @@ impl InventoryServer {
         }
         json!({"locations": report.len(), "report": report}).to_string()
     }
+
+    // === Wave Planning ===
+
+    #[tool(description = "Create a wave (batch multiple pick orders together for efficient warehouse picking).")]
+    async fn wave_create(&self, Parameters(input): Parameters<WaveCreateInput>) -> String {
+        let id = format!("wave_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let wave = Wave { id: id.clone(), name: input.name, status: "planning".into(), pick_ids: input.pick_ids.clone(), priority: input.priority.unwrap_or_else(|| "medium".into()), created_at: now(), released_at: None, completed_at: None };
+        // Link picks to wave
+        let mut picks = self.store.pick_orders.lock().unwrap();
+        for pid in &input.pick_ids {
+            if let Some(p) = picks.get_mut(pid) { p.wave_id = Some(id.clone()); }
+        }
+        drop(picks);
+        self.store.waves.lock().unwrap().insert(id.clone(), wave);
+        json!({"status": "created", "wave_id": id, "pick_orders": input.pick_ids.len()}).to_string()
+    }
+
+    #[tool(description = "Release a wave (moves all pick orders in the wave to 'picking' status, assigns to pickers).")]
+    async fn wave_release(&self, Parameters(input): Parameters<WaveIdInput>) -> String {
+        let mut waves = self.store.waves.lock().unwrap();
+        match waves.get_mut(&input.wave_id) {
+            Some(w) => {
+                w.status = "in_progress".into();
+                w.released_at = Some(now());
+                let pick_ids = w.pick_ids.clone();
+                drop(waves);
+                let mut picks = self.store.pick_orders.lock().unwrap();
+                for pid in &pick_ids {
+                    if let Some(p) = picks.get_mut(pid) { p.status = "picking".into(); }
+                }
+                json!({"status": "released", "wave_id": input.wave_id, "picks_released": pick_ids.len()}).to_string()
+            }
+            None => json!({"error": "WAVE_NOT_FOUND"}).to_string(),
+        }
+    }
+
+    #[tool(description = "Complete a wave (marks wave as completed when all picks are shipped).")]
+    async fn wave_complete(&self, Parameters(input): Parameters<WaveIdInput>) -> String {
+        let mut waves = self.store.waves.lock().unwrap();
+        match waves.get_mut(&input.wave_id) {
+            Some(w) => {
+                w.status = "completed".into();
+                w.completed_at = Some(now());
+                json!({"status": "completed", "wave_id": input.wave_id}).to_string()
+            }
+            None => json!({"error": "WAVE_NOT_FOUND"}).to_string(),
+        }
+    }
+
+    #[tool(description = "List waves with their status and pick order counts.")]
+    async fn wave_list(&self) -> String {
+        let waves: Vec<_> = self.store.waves.lock().unwrap().values().cloned().collect();
+        json!({"count": waves.len(), "waves": waves}).to_string()
+    }
+
+    // === Barcode / Label Generation ===
+
+    #[tool(description = "Generate a barcode label for a SKU, location, lot, shipment, or receipt. Returns barcode value and label text for printing.")]
+    async fn label_generate(&self, Parameters(input): Parameters<LabelInput>) -> String {
+        let barcode_value = match input.barcode_type.as_str() {
+            "sku" => format!("SKU-{}", input.entity_id),
+            "location" => format!("LOC-{}", input.entity_id),
+            "lot" => format!("LOT-{}", input.entity_id),
+            "shipment" => format!("SHP-{}", input.entity_id),
+            "receipt" => format!("RCV-{}", input.entity_id),
+            _ => format!("ID-{}", input.entity_id),
+        };
+        let format = input.barcode_format.unwrap_or_else(|| "code128".into());
+        let mut label_text = vec![barcode_value.clone()];
+        // Add context info
+        if input.barcode_type == "sku" {
+            if let Some(item) = self.store.items.lock().unwrap().get(&input.entity_id) {
+                label_text.push(item.name.clone());
+                label_text.push(format!("Cat: {}", item.category));
+            }
+        } else if input.barcode_type == "location" {
+            if let Some(loc) = self.store.locations.lock().unwrap().get(&input.entity_id) {
+                label_text.push(loc.name.clone());
+                label_text.push(format!("Type: {}", loc.location_type));
+            }
+        }
+        if let Some(ref extra) = input.extra_text { label_text.extend(extra.clone()); }
+
+        let id = format!("lbl_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let label = BarcodeLabel { id: id.clone(), barcode_type: input.barcode_type, entity_id: input.entity_id, barcode_format: format.clone(), barcode_value: barcode_value.clone(), label_text: label_text.clone(), generated_at: now() };
+        self.store.labels.lock().unwrap().push(label);
+        json!({"label_id": id, "barcode_value": barcode_value, "barcode_format": format, "label_text": label_text, "printable": true}).to_string()
+    }
+
+    #[tool(description = "Generate labels in batch (multiple SKUs, locations, or shipments at once).")]
+    async fn label_batch(&self, Parameters(input): Parameters<LabelBatchInput>) -> String {
+        let format = input.barcode_format.unwrap_or_else(|| "code128".into());
+        let mut labels = Vec::new();
+        for entity_id in &input.entity_ids {
+            let barcode_value = match input.barcode_type.as_str() {
+                "sku" => format!("SKU-{}", entity_id),
+                "location" => format!("LOC-{}", entity_id),
+                "lot" => format!("LOT-{}", entity_id),
+                _ => format!("ID-{}", entity_id),
+            };
+            let id = format!("lbl_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+            let label = BarcodeLabel { id: id.clone(), barcode_type: input.barcode_type.clone(), entity_id: entity_id.clone(), barcode_format: format.clone(), barcode_value: barcode_value.clone(), label_text: vec![barcode_value.clone()], generated_at: now() };
+            labels.push(json!({"label_id": id, "entity_id": entity_id, "barcode_value": barcode_value}));
+            self.store.labels.lock().unwrap().push(label);
+        }
+        json!({"count": labels.len(), "barcode_format": format, "labels": labels}).to_string()
+    }
 }
 
 // --- Additional input types ---
@@ -401,4 +508,39 @@ pub struct CycleCountCompleteInput {
     pub counted_by: String,
     /// Actual counts: [{"sku": "...", "actual_qty": N}]
     pub counts: Vec<Value>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WaveCreateInput {
+    /// Wave name (e.g. "Morning Wave", "Priority Rush")
+    pub name: String,
+    /// Pick order IDs to include in this wave
+    pub pick_ids: Vec<String>,
+    /// Priority: low, medium, high, critical
+    pub priority: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WaveIdInput { pub wave_id: String }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LabelInput {
+    /// Type: sku, location, lot, shipment, receipt
+    pub barcode_type: String,
+    /// Entity ID (SKU code, location ID, lot number, etc.)
+    pub entity_id: String,
+    /// Barcode format: code128, ean13, qr, datamatrix (default: code128)
+    pub barcode_format: Option<String>,
+    /// Extra text lines to print on label
+    pub extra_text: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LabelBatchInput {
+    /// Type: sku, location, lot, shipment
+    pub barcode_type: String,
+    /// List of entity IDs to generate labels for
+    pub entity_ids: Vec<String>,
+    /// Barcode format (default: code128)
+    pub barcode_format: Option<String>,
 }
