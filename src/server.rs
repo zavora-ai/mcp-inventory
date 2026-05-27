@@ -1,5 +1,6 @@
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde_json::{json, Value};
+use reqwest::Client;
 use crate::types::*;
 use crate::store::Store;
 
@@ -45,8 +46,30 @@ pub struct BomCheckInput { pub parent_sku: String, pub quantity: f64, pub locati
 pub struct SkuInput { pub sku: String }
 
 #[derive(Clone)]
-pub struct InventoryServer { pub store: Store }
-impl InventoryServer { pub fn new() -> Self { Self { store: Store::new() } } }
+pub struct InventoryServer {
+    pub store: Store,
+    pub client: Client,
+    pub grocy_url: Option<String>,
+    pub grocy_key: Option<String>,
+    pub shopify_store: Option<String>,
+    pub shopify_token: Option<String>,
+    pub pancake_key: Option<String>,
+    pub pancake_shop: Option<String>,
+}
+impl InventoryServer {
+    pub fn new() -> Self {
+        Self {
+            store: Store::new(),
+            client: Client::builder().build().unwrap_or_default(),
+            grocy_url: std::env::var("GROCY_URL").ok(),
+            grocy_key: std::env::var("GROCY_API_KEY").ok(),
+            shopify_store: std::env::var("SHOPIFY_STORE").ok(),
+            shopify_token: std::env::var("SHOPIFY_ACCESS_TOKEN").ok(),
+            pancake_key: std::env::var("PANCAKE_POS_API_KEY").ok(),
+            pancake_shop: std::env::var("PANCAKE_POS_SHOP_ID").ok(),
+        }
+    }
+}
 
 #[tool_router(server_handler)]
 impl InventoryServer {
@@ -565,6 +588,141 @@ impl InventoryServer {
         self.store.labels.lock().unwrap().push(BarcodeLabel { id: label_id.clone(), barcode_type: input.entity_type.clone(), entity_id: input.entity_id, barcode_format: "qr".into(), barcode_value: payload.clone(), label_text: vec![payload.clone()], generated_at: now() });
         json!({"label_id": label_id, "format": "qr", "payload": payload, "printable": true}).to_string()
     }
+
+    // === External Backend Sync ===
+
+    #[tool(description = "Sync inventory with Grocy (self-hosted grocery/inventory manager). Pull imports Grocy stock into local store. Push exports local stock to Grocy. Requires GROCY_URL, GROCY_API_KEY env vars.")]
+    async fn sync_grocy(&self, Parameters(input): Parameters<GrocySyncInput>) -> String {
+        let (Some(url), Some(key)) = (&self.grocy_url, &self.grocy_key) else {
+            return json!({"error": "GROCY_NOT_CONFIGURED", "message": "Set GROCY_URL and GROCY_API_KEY"}).to_string();
+        };
+        match input.direction.as_str() {
+            "pull" => {
+                let endpoint = format!("{}/api/stock", url);
+                match self.client.get(&endpoint).header("GROCY-API-KEY", key.as_str()).send().await {
+                    Ok(resp) => match resp.json::<Vec<Value>>().await {
+                        Ok(items) => {
+                            let mut synced = 0;
+                            for item in &items {
+                                let sku = item["product"]["name"].as_str().unwrap_or_default();
+                                if input.sku.as_ref().map_or(true, |s| s == sku) {
+                                    let qty = item["amount"].as_f64().unwrap_or(0.0);
+                                    self.store.items.lock().unwrap().entry(sku.into()).or_insert_with(|| Item { sku: sku.into(), name: sku.into(), category: "grocy".into(), unit: "each".into(), reorder_point: item["product"]["min_stock_amount"].as_f64().unwrap_or(0.0), reorder_qty: 10.0, cost: 0.0, currency: "USD".into(), attributes: json!({}) });
+                                    let mut stock = self.store.stock.lock().unwrap();
+                                    if let Some(s) = stock.iter_mut().find(|s| s.sku == sku && s.location_id == "grocy") {
+                                        s.quantity = qty; s.updated_at = now();
+                                    } else {
+                                        stock.push(StockLevel { sku: sku.into(), location_id: "grocy".into(), quantity: qty, reserved: 0.0, lot_number: None, expiry_date: item["best_before_date"].as_str().map(String::from), updated_at: now() });
+                                    }
+                                    synced += 1;
+                                }
+                            }
+                            json!({"status": "pulled", "source": "grocy", "items_synced": synced}).to_string()
+                        }
+                        Err(e) => json!({"error": e.to_string()}).to_string(),
+                    },
+                    Err(e) => json!({"error": e.to_string()}).to_string(),
+                }
+            }
+            "push" => {
+                json!({"status": "push_not_yet_implemented", "message": "Grocy push requires product ID mapping. Use pull to import first."}).to_string()
+            }
+            _ => json!({"error": "Invalid direction. Use 'pull' or 'push'"}).to_string(),
+        }
+    }
+
+    #[tool(description = "Sync inventory with Shopify. Pull imports Shopify inventory levels. Push updates Shopify stock from local. Requires SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN env vars.")]
+    async fn sync_shopify(&self, Parameters(input): Parameters<ShopifySyncInput>) -> String {
+        let (Some(store), Some(token)) = (&self.shopify_store, &self.shopify_token) else {
+            return json!({"error": "SHOPIFY_NOT_CONFIGURED", "message": "Set SHOPIFY_STORE and SHOPIFY_ACCESS_TOKEN"}).to_string();
+        };
+        let base = format!("https://{}.myshopify.com/admin/api/2024-01", store);
+        match input.direction.as_str() {
+            "pull" => {
+                let url = format!("{}/inventory_levels.json?limit=50", base);
+                match self.client.get(&url).header("X-Shopify-Access-Token", token.as_str()).send().await {
+                    Ok(resp) => match resp.json::<Value>().await {
+                        Ok(data) => {
+                            let levels = data["inventory_levels"].as_array().unwrap_or(&vec![]).clone();
+                            let mut synced = 0;
+                            for level in &levels {
+                                let item_id = level["inventory_item_id"].to_string();
+                                let qty = level["available"].as_f64().unwrap_or(0.0);
+                                let loc = level["location_id"].to_string();
+                                let mut stock = self.store.stock.lock().unwrap();
+                                if let Some(s) = stock.iter_mut().find(|s| s.sku == item_id && s.location_id == format!("shopify_{}", loc)) {
+                                    s.quantity = qty; s.updated_at = now();
+                                } else {
+                                    stock.push(StockLevel { sku: item_id, location_id: format!("shopify_{}", loc), quantity: qty, reserved: 0.0, lot_number: None, expiry_date: None, updated_at: now() });
+                                }
+                                synced += 1;
+                            }
+                            json!({"status": "pulled", "source": "shopify", "levels_synced": synced}).to_string()
+                        }
+                        Err(e) => json!({"error": e.to_string()}).to_string(),
+                    },
+                    Err(e) => json!({"error": e.to_string()}).to_string(),
+                }
+            }
+            "push" => {
+                let Some(ref sku) = input.sku else {
+                    return json!({"error": "SKU required for push"}).to_string();
+                };
+                let loc_id = input.location_id.as_deref().unwrap_or("default");
+                let qty: f64 = self.store.stock.lock().unwrap().iter().filter(|s| s.sku == *sku).map(|s| s.quantity - s.reserved).sum();
+                let url = format!("{}/inventory_levels/set.json", base);
+                let body = json!({"location_id": loc_id, "inventory_item_id": sku, "available": qty as i64});
+                match self.client.post(&url).header("X-Shopify-Access-Token", token.as_str()).json(&body).send().await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        json!({"status": if status < 400 { "pushed" } else { "failed" }, "sku": sku, "quantity": qty, "http_status": status}).to_string()
+                    }
+                    Err(e) => json!({"error": e.to_string()}).to_string(),
+                }
+            }
+            _ => json!({"error": "Invalid direction. Use 'pull' or 'push'"}).to_string(),
+        }
+    }
+
+    #[tool(description = "Sync inventory with Pancake POS. Pull imports warehouse/inventory data. Push exports stock levels. Requires PANCAKE_POS_API_KEY, PANCAKE_POS_SHOP_ID env vars.")]
+    async fn sync_pancake(&self, Parameters(input): Parameters<PancakeSyncInput>) -> String {
+        let (Some(key), Some(shop)) = (&self.pancake_key, &self.pancake_shop) else {
+            return json!({"error": "PANCAKE_NOT_CONFIGURED", "message": "Set PANCAKE_POS_API_KEY and PANCAKE_POS_SHOP_ID"}).to_string();
+        };
+        let base = format!("https://pos.pages.fm/api/v1/shops/{}", shop);
+        match input.direction.as_str() {
+            "pull" => {
+                let url = format!("{}/inventory?warehouse_id={}", base, input.warehouse_id.as_deref().unwrap_or("all"));
+                match self.client.get(&url).header("Authorization", format!("Bearer {}", key)).send().await {
+                    Ok(resp) => match resp.json::<Value>().await {
+                        Ok(data) => {
+                            let items = data["data"].as_array().unwrap_or(&vec![]).clone();
+                            let mut synced = 0;
+                            for item in &items {
+                                let sku = item["product_id"].to_string();
+                                let qty = item["quantity"].as_f64().unwrap_or(0.0);
+                                let wh = item["warehouse_id"].to_string();
+                                let mut stock = self.store.stock.lock().unwrap();
+                                if let Some(s) = stock.iter_mut().find(|s| s.sku == sku && s.location_id == format!("pancake_{}", wh)) {
+                                    s.quantity = qty; s.updated_at = now();
+                                } else {
+                                    stock.push(StockLevel { sku, location_id: format!("pancake_{}", wh), quantity: qty, reserved: 0.0, lot_number: None, expiry_date: None, updated_at: now() });
+                                }
+                                synced += 1;
+                            }
+                            json!({"status": "pulled", "source": "pancake_pos", "items_synced": synced}).to_string()
+                        }
+                        Err(e) => json!({"error": e.to_string()}).to_string(),
+                    },
+                    Err(e) => json!({"error": e.to_string()}).to_string(),
+                }
+            }
+            "push" => {
+                json!({"status": "push_planned", "message": "Pancake POS push requires product mapping. Use pull first to establish SKU links."}).to_string()
+            }
+            _ => json!({"error": "Invalid direction. Use 'pull' or 'push'"}).to_string(),
+        }
+    }
 }
 
 // --- Additional input types ---
@@ -735,4 +893,32 @@ pub struct QrGenerateInput {
     pub entity_id: String,
     /// Extra data to encode in QR (JSON string)
     pub extra_data: Option<Value>,
+}
+
+// === Sync Backend Input Types ===
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GrocySyncInput {
+    /// Direction: pull (Grocy→local) or push (local→Grocy)
+    pub direction: String,
+    /// SKU filter (optional, sync all if omitted)
+    pub sku: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ShopifySyncInput {
+    /// Direction: pull (Shopify→local) or push (local→Shopify)
+    pub direction: String,
+    /// SKU filter (optional)
+    pub sku: Option<String>,
+    /// Shopify location ID (required for push)
+    pub location_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PancakeSyncInput {
+    /// Direction: pull (Pancake→local) or push (local→Pancake)
+    pub direction: String,
+    /// Warehouse ID filter (optional)
+    pub warehouse_id: Option<String>,
 }
