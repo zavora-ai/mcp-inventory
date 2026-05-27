@@ -18,9 +18,55 @@ pub struct Item {
 pub struct Location {
     pub id: String,
     pub name: String,
-    pub location_type: String, // warehouse, store, bin, zone, transit
+    pub location_type: String, // warehouse, zone, aisle, rack, bin, staging, dock
     pub parent_id: Option<String>,
     pub address: Option<String>,
+    pub capacity_units: Option<f64>,   // max units this location can hold
+    pub capacity_weight_kg: Option<f64>, // max weight
+    pub capacity_volume_m3: Option<f64>, // max volume
+    pub used_units: f64,
+    pub used_weight_kg: f64,
+    pub used_volume_m3: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PickOrder {
+    pub id: String,
+    pub status: String, // pending, picking, packed, shipped, cancelled
+    pub order_reference: String,
+    pub lines: Vec<PickLine>,
+    pub assigned_to: Option<String>,
+    pub wave_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PickLine {
+    pub sku: String,
+    pub quantity: f64,
+    pub from_location: String,
+    pub picked_qty: f64,
+    pub status: String, // pending, picked, short
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PutawayRule {
+    pub id: String,
+    pub category: String,       // item category this rule applies to
+    pub target_zone: String,    // preferred zone/location
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CycleCount {
+    pub id: String,
+    pub location_id: String,
+    pub status: String, // scheduled, in_progress, completed
+    pub scheduled_date: String,
+    pub counted_by: Option<String>,
+    pub discrepancies: Vec<Value>,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
